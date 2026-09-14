@@ -424,6 +424,32 @@ def backtest_epa(sched, epa, min_week, window_games, alpha, progress=None):
 
 
 # ----------------------------------------------------------------------
+# Weight by week — should the blend be one number all season?
+# ----------------------------------------------------------------------
+def weight_by_week(res):
+    """
+    MODEL_WEIGHT is a single constant applied in Week 1 and Week 17 alike.
+    But in Week 1 the ratings contain no current-season information at all,
+    and by Week 12 they are mostly current. Measure the weight the model
+    earned in each part of the season instead of averaging over all of it.
+    """
+    r = res.dropna(subset=["pred_margin", "mkt_margin", "actual_margin"]).copy()
+    rows = []
+    for lo, hi, lab in [(1, 5, "weeks 1-4"), (5, 9, "weeks 5-8"),
+                        (9, 13, "weeks 9-12"), (13, 25, "weeks 13+")]:
+        b = r[(r.week >= lo) & (r.week < hi)]
+        if len(b) < 250:
+            continue
+        beta, t = incremental_test(b.actual_margin.values, b.mkt_margin.values,
+                                   b.pred_margin.values)
+        rows.append({"Period": lab, "Games": len(b),
+                     "Measured weight": round(float(beta[2]), 3),
+                     "t": round(float(t), 2),
+                     "Use": round(max(float(beta[2]), 0.0), 3)})
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------
 # Wind check — does the signal-lab hit survive out of sample?
 # ----------------------------------------------------------------------
 def wind_check(sched, sign):
@@ -597,7 +623,7 @@ with st.sidebar:
 mode = st.sidebar.radio(
     "What to run",
     ["Backtest", "EPA model", "Signal lab", "Wind check",
-     "Robustness sweep"])
+     "Weight by week", "Robustness sweep"])
 
 if not run:
     st.info("Set the seasons on the left, then run.")
@@ -710,6 +736,39 @@ if mode == "Robustness sweep":
     st.caption("These training numbers are inflated by selection — the best "
                "of 72 always looks good. Do not read them as results.")
     st.dataframe(out["table"], hide_index=True, use_container_width=True)
+    st.stop()
+
+if mode == "Weight by week":
+    st.header("Weight by week")
+    st.write(
+        "The blend is a single number today. In Week 1 the ratings hold no "
+        "current-season information; by Week 12 they mostly do. This measures "
+        "what the model earned in each part of the season."
+    )
+    _res = backtest(sched, min_week, window, carry, alpha,
+                    progress=lambda f, m: bar.progress(f, m))[0]
+    bar.empty()
+    _tbl = weight_by_week(_res)
+    if _tbl.empty:
+        st.error("Not enough games. Widen the season range.")
+        st.stop()
+    st.dataframe(_tbl, hide_index=True, use_container_width=True)
+    st.caption(
+        "\"Use\" is the measured weight floored at zero — a negative "
+        "coefficient means the model was worse than ignoring it, and the "
+        "right response is to ignore it, not to bet the other way."
+    )
+    st.subheader("Constants for Sunday Edge")
+    st.code(
+        "WEIGHT_BY_WEEK = {\n"
+        + "".join(f"    {r['Period']!r}: {r['Use']},\n"
+                  for _, r in _tbl.iterrows())
+        + "}", language="python")
+    st.caption(
+        "Compare against the single 0.099 in use now. If the early buckets "
+        "come back at or below zero, the model should not be moving the line "
+        "at all in the first month."
+    )
     st.stop()
 
 if mode == "Wind check":
