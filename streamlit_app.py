@@ -193,6 +193,18 @@ def ats_table(r):
 # ----------------------------------------------------------------------
 # Signal lab
 # ----------------------------------------------------------------------
+def line_sign(sched):
+    """
+    Which way spread_line points. nflverse states it from the home side, but
+    verify rather than assume — a flipped sign would invert every result.
+    """
+    d = sched.dropna(subset=["spread_line", "home_score", "away_score"])
+    if len(d) < 50:
+        return 1.0
+    m = d["home_score"] - d["away_score"]
+    return 1.0 if float(np.corrcoef(d["spread_line"], m)[0, 1]) > 0 else -1.0
+
+
 def ols_t(y, x):
     """Regress y on x plus a constant. Returns slope, t-stat, n."""
     ok = np.isfinite(x) & np.isfinite(y)
