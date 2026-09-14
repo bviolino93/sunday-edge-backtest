@@ -424,6 +424,60 @@ def backtest_epa(sched, epa, min_week, window_games, alpha, progress=None):
 
 
 # ----------------------------------------------------------------------
+# Wind check — does the signal-lab hit survive out of sample?
+# ----------------------------------------------------------------------
+def wind_check(sched, sign):
+    """
+    Ten features were tested, so one hit at |t|>2.5 could be luck. And the
+    usual way a finding like this dies is that it was real in the 2000s and
+    got priced out. Fit on the EARLY seasons, test on the LATE ones.
+    """
+    g = sched.dropna(subset=["home_score", "away_score", "total_line"]).copy()
+    for c in ("wind", "temp", "total_line"):
+        if c in g.columns:
+            g[c] = pd.to_numeric(g[c], errors="coerce")
+    g["roof_str"] = g.get("roof", "").astype(str).str.lower()
+    g = g[g["roof_str"].isin(["outdoors", "open"])]
+    g = g[g["wind"].notna()]
+    g["total_points"] = g["home_score"] + g["away_score"]
+    g["resid"] = g["total_points"] - g["total_line"]
+    if len(g) < 500:
+        return None
+
+    seasons = sorted(g["season"].unique())
+    cut = seasons[len(seasons) // 2]
+    early, late = g[g["season"] < cut], g[g["season"] >= cut]
+
+    def fit(d):
+        r = ols_t(d["resid"].values.astype(float),
+                  d["wind"].values.astype(float))
+        return None if r is None else {"slope": r[0], "t": r[1], "n": r[2]}
+
+    out = {"cut": cut, "early": fit(early), "late": fit(late),
+           "all": fit(g)}
+
+    # What betting it would have produced in the HOLDOUT half, using the
+    # coefficient fit on the early half only.
+    bets = []
+    if out["early"] and out["late"]:
+        b = out["early"]["slope"]
+        for thr in (1.0, 1.5, 2.0, 3.0):
+            d = late.copy()
+            d["edge"] = -b * d["wind"]          # predicted points BELOW line
+            sel = d[d["edge"] >= thr]
+            sel = sel[sel["total_points"] != sel["total_line"]]
+            if len(sel) < 40:
+                continue
+            w = int((sel["total_points"] < sel["total_line"]).sum())
+            l = len(sel) - w
+            bets.append({"Edge needed": f"{thr:g} pts", "Bets": len(sel),
+                         "Record": f"{w}-{l}", "Win %": f"{w/len(sel):.1%}",
+                         "ROI": f"{(w*(100/110)-l)/len(sel):+.1%}"})
+    out["bets"] = pd.DataFrame(bets)
+    return out
+
+
+# ----------------------------------------------------------------------
 # Robustness sweep
 # ----------------------------------------------------------------------
 GRID = [
@@ -508,7 +562,8 @@ with st.sidebar:
 
 mode = st.sidebar.radio(
     "What to run",
-    ["Backtest", "EPA model", "Signal lab", "Robustness sweep"])
+    ["Backtest", "EPA model", "Signal lab", "Wind check",
+     "Robustness sweep"])
 
 if not run:
     st.info("Set the seasons on the left, then run.")
@@ -621,6 +676,56 @@ if mode == "Robustness sweep":
     st.caption("These training numbers are inflated by selection — the best "
                "of 72 always looks good. Do not read them as results.")
     st.dataframe(out["table"], hide_index=True, use_container_width=True)
+    st.stop()
+
+if mode == "Wind check":
+    st.header("Wind check")
+    st.write(
+        "The signal lab found wind on totals. This asks whether it survives "
+        "the two ways a finding like that usually dies: it was one of ten "
+        "tests, and it may have been real once and since been priced in."
+    )
+    _w = wind_check(sched, line_sign(sched))
+    bar.empty()
+    if not _w or not _w["early"] or not _w["late"]:
+        st.error("Not enough outdoor games with wind data. Widen the seasons.")
+        st.stop()
+
+    st.subheader("Does it hold in both halves?")
+    st.dataframe(pd.DataFrame([
+        {"Period": f"before {_w['cut']}", "Games": _w["early"]["n"],
+         "Pts per mph": round(_w["early"]["slope"], 3),
+         "t": round(_w["early"]["t"], 2)},
+        {"Period": f"{_w['cut']} onward", "Games": _w["late"]["n"],
+         "Pts per mph": round(_w["late"]["slope"], 3),
+         "t": round(_w["late"]["t"], 2)},
+        {"Period": "all seasons", "Games": _w["all"]["n"],
+         "Pts per mph": round(_w["all"]["slope"], 3),
+         "t": round(_w["all"]["t"], 2)},
+    ]), hide_index=True, use_container_width=True)
+
+    _lt = _w["late"]["t"]
+    if abs(_lt) < 2:
+        st.error(
+            f"**It does not survive.** The effect is absent in the holdout "
+            f"half (t = {_lt:+.2f}). Either it was noise, or the market has "
+            f"priced it since. Do not build on this."
+        )
+    elif _w["late"]["slope"] * _w["early"]["slope"] > 0:
+        st.success(
+            f"**It survives.** Same sign in both halves, holdout t = "
+            f"{_lt:+.2f}. This is a real input the closing line misses."
+        )
+    else:
+        st.warning("Sign flips between halves. Treat as noise.")
+
+    if not _w["bets"].empty:
+        st.subheader("Betting Unders on it, holdout seasons only")
+        st.caption(
+            "Coefficient fit on the early half, applied to the late half. "
+            "Breakeven at -110 is 52.4%."
+        )
+        st.dataframe(_w["bets"], hide_index=True, use_container_width=True)
     st.stop()
 
 if mode == "Signal lab":
