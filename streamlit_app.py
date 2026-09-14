@@ -424,6 +424,100 @@ def backtest_epa(sched, epa, min_week, window_games, alpha, progress=None):
 
 
 # ----------------------------------------------------------------------
+# Injury lab
+# ----------------------------------------------------------------------
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_injuries(first, last):
+    d = nfl.import_injuries(list(range(first, last + 1)))
+    keep = ["season", "week", "team", "position", "report_status",
+            "practice_status", "full_name"]
+    d = d[[c for c in keep if c in d.columns]].copy()
+    d["report_status"] = d.get("report_status", "").astype(str).str.lower()
+    d["position"] = d.get("position", "").astype(str).str.upper()
+    return d
+
+
+def injury_features(sched, inj):
+    """
+    Counts of players ruled OUT by team-week, split by position group. The
+    market sees the same report on Wednesday, so this asks whether it
+    underweights any part of it — not whether injuries matter.
+    """
+    out = inj[inj["report_status"].str.contains("out", na=False)].copy()
+    grp = {"QB": "qb", "T": "ol", "G": "ol", "C": "ol", "OL": "ol",
+           "OT": "ol", "OG": "ol"}
+    out["grp"] = out["position"].map(grp).fillna("other")
+    piv = (out.groupby(["season", "week", "team", "grp"]).size()
+           .unstack("grp").fillna(0).reset_index())
+    for c in ("qb", "ol", "other"):
+        if c not in piv.columns:
+            piv[c] = 0.0
+    return piv
+
+
+def run_injury_lab(sched, inj, sign):
+    g = sched.dropna(subset=["home_score", "away_score", "spread_line"]).copy()
+    g["mkt_margin"] = sign * g["spread_line"]
+    g["resid_margin"] = (g["home_score"] - g["away_score"]) - g["mkt_margin"]
+    g["total_points"] = g["home_score"] + g["away_score"]
+    g["resid_total"] = g["total_points"] - pd.to_numeric(
+        g.get("total_line"), errors="coerce")
+
+    piv = injury_features(sched, inj)
+    for side in ("home", "away"):
+        m = piv.rename(columns={"team": f"{side}_team",
+                                "qb": f"{side}_qb_out",
+                                "ol": f"{side}_ol_out",
+                                "other": f"{side}_other_out"})
+        g = g.merge(m, on=["season", "week", f"{side}_team"], how="left")
+    for c in g.columns:
+        if c.endswith("_out"):
+            g[c] = pd.to_numeric(g[c], errors="coerce").fillna(0.0)
+
+    # First week on a new QB vs an established backup: only the first is news.
+    g = g.sort_values(["season", "week"])
+    for side in ("home", "away"):
+        col = f"{side}_qb_out"
+        g[f"{side}_qb_new"] = (
+            (g[col] > 0)
+            & (g.groupby([f"{side}_team", "season"])[col].shift(1).fillna(0) == 0)
+        ).astype(float)
+
+    tests = [
+        ("QB ruled out (home minus away)", "Spread",
+         g["resid_margin"], g["away_qb_out"] - g["home_qb_out"],
+         "The market moves 6-7 pts on this. Does it move enough?"),
+        ("QB out, FIRST week only", "Spread",
+         g["resid_margin"], g["away_qb_new"] - g["home_qb_new"],
+         "Week one on a backup is news; week three is not."),
+        ("O-line starters out (home minus away)", "Spread",
+         g["resid_margin"], g["away_ol_out"] - g["home_ol_out"],
+         "Individually small, collectively large \u2014 the shape markets miss."),
+        ("All other positions out (home minus away)", "Spread",
+         g["resid_margin"], g["away_other_out"] - g["home_other_out"], ""),
+        ("Total players out, both teams", "Total",
+         g["resid_total"],
+         g["home_qb_out"] + g["away_qb_out"] + g["home_ol_out"]
+         + g["away_ol_out"] + g["home_other_out"] + g["away_other_out"], ""),
+        ("QB out either team", "Total",
+         g["resid_total"], (g["home_qb_out"] + g["away_qb_out"]), ""),
+        ("O-line out both teams", "Total",
+         g["resid_total"], g["home_ol_out"] + g["away_ol_out"], ""),
+    ]
+    rows = []
+    for name, market, y, x, note in tests:
+        r = ols_t(np.asarray(y, dtype=float), np.asarray(x, dtype=float))
+        if r is None:
+            continue
+        rows.append({"Signal": name, "Market": market, "Games": r[2],
+                     "Effect per player": round(r[0], 3), "t": round(r[1], 2),
+                     "Verdict": "SIGNAL" if abs(r[1]) > 2.5 else "nothing",
+                     "_note": note})
+    return pd.DataFrame(rows).sort_values("t", key=lambda s: s.abs(),
+                                          ascending=False)
+
+
+# ----------------------------------------------------------------------
 # Weight by week — should the blend be one number all season?
 # ----------------------------------------------------------------------
 def weight_by_week(res):
@@ -623,7 +717,7 @@ with st.sidebar:
 mode = st.sidebar.radio(
     "What to run",
     ["Backtest", "EPA model", "Signal lab", "Wind check",
-     "Weight by week", "Robustness sweep"])
+     "Weight by week", "Injury lab", "Robustness sweep"])
 
 if not run:
     st.info("Set the seasons on the left, then run.")
@@ -736,6 +830,47 @@ if mode == "Robustness sweep":
     st.caption("These training numbers are inflated by selection — the best "
                "of 72 always looks good. Do not read them as results.")
     st.dataframe(out["table"], hide_index=True, use_container_width=True)
+    st.stop()
+
+if mode == "Injury lab":
+    st.header("Injury lab")
+    st.write(
+        "QB injuries obviously decide games. The question here is narrower: "
+        "does the closing line underweight any part of the injury report? "
+        "Everything below is public by Wednesday, so the prior is no."
+    )
+    try:
+        bar.progress(0.1, "Loading injury reports\u2026")
+        _inj = load_injuries(max(yr[0], 2009), yr[1])
+    except Exception as e:
+        bar.empty()
+        st.error(f"Could not load injuries: {e}")
+        st.stop()
+    _tbl = run_injury_lab(sched, _inj, line_sign(sched))
+    bar.empty()
+    if _tbl.empty:
+        st.error("No overlap between injuries and schedules in that range.")
+        st.stop()
+    st.dataframe(_tbl.drop(columns=["_note"]), hide_index=True,
+                 use_container_width=True)
+    _hits = _tbl[_tbl["Verdict"] == "SIGNAL"]
+    if _hits.empty:
+        st.info(
+            "Nothing clears |t| > 2.5. The injury report is public days "
+            "ahead and the market prices it \u2014 including the big QB moves."
+        )
+    else:
+        for _, hh in _hits.iterrows():
+            st.success(
+                f"**{hh['Signal']}** ({hh['Market']}): "
+                f"{hh['Effect per player']:+.3f} pts per player out, "
+                f"t = {hh['t']:+.2f}, {hh['Games']:,} games. "
+                + (hh["_note"] or "")
+            )
+        st.caption(
+            "Seven tests were run, so a single hit near the bar may be luck. "
+            "Split the seasons in half before believing it."
+        )
     st.stop()
 
 if mode == "Weight by week":
