@@ -474,6 +474,40 @@ def wind_check(sched, sign):
                          "Record": f"{w}-{l}", "Win %": f"{w/len(sel):.1%}",
                          "ROI": f"{(w*(100/110)-l)/len(sel):+.1%}"})
     out["bets"] = pd.DataFrame(bets)
+
+    # THE decisive test. nflverse wind is recorded game conditions, i.e. what
+    # actually happened. At bet time you have a forecast, and the closing
+    # total already prices that forecast. So some of the edge above may be
+    # "actual wind differed from forecast" — real in the data, impossible to
+    # bet. Degrade the wind with forecast error and see what survives.
+    rows = []
+    rng = np.random.default_rng(11)
+    for err in (0.0, 2.0, 3.5, 5.0):
+        tot = []
+        for _ in range(12 if err else 1):
+            d = late.copy()
+            noisy = d["wind"].values.astype(float)
+            if err:
+                noisy = np.clip(noisy + rng.normal(0, err, len(noisy)), 0, None)
+            d["edge"] = -out["early"]["slope"] * noisy
+            sel = d[(d["edge"] >= 1.5)
+                    & (d["total_points"] != d["total_line"])]
+            if len(sel) < 40:
+                continue
+            w = int((sel["total_points"] < sel["total_line"]).sum())
+            tot.append((len(sel), w))
+        if not tot:
+            continue
+        n = int(np.mean([t[0] for t in tot]))
+        w = float(np.mean([t[1] for t in tot]))
+        l = n - w
+        rows.append({
+            "Forecast error": "none (actual wind)" if not err
+                              else f"+/- {err:g} mph",
+            "Bets": n, "Win %": f"{w/n:.1%}",
+            "ROI": f"{(w * (100 / 110) - l) / n:+.1%}",
+        })
+    out["noise"] = pd.DataFrame(rows)
     return out
 
 
@@ -718,6 +752,21 @@ if mode == "Wind check":
         )
     else:
         st.warning("Sign flips between halves. Treat as noise.")
+
+    if not _w.get("noise", pd.DataFrame()).empty:
+        st.subheader("Does it survive forecast error?")
+        st.caption(
+            "nflverse records the wind that actually blew. You bet on a "
+            "forecast, and the closing total already prices that forecast \u2014 "
+            "so an edge that only exists with perfect wind knowledge is not "
+            "bettable. Typical one-to-two-day wind forecast error is 3-4 mph."
+        )
+        st.dataframe(_w["noise"], hide_index=True, use_container_width=True)
+        st.caption(
+            "If the ROI holds up at +/- 3.5 mph, the edge is real and "
+            "bettable. If it collapses toward zero, you were being paid for "
+            "knowing the weather in advance."
+        )
 
     if not _w["bets"].empty:
         st.subheader("Betting Unders on it, holdout seasons only")
